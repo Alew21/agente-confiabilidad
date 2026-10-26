@@ -15,12 +15,15 @@ Funciona de dos formas con el MISMO archivo:
        GEMINI_API_KEY = "tu_clave_de_google_ai_studio"
        CLAVE_ADMIN    = "contraseña para ver Ajustes y Conocimiento"   (modo compañeros)
        MODELO_GEMINI  = "gemini-3.8-flash"                             (opcional)
+       SUPABASE_URL   = "https://xxxx.supabase.co"                     (guardar cuentas y conversaciones)
+       SUPABASE_KEY   = "sb_secret_..."                                (clave secreta de Supabase)
 
 Archivos que se crean junto a la página:
     conocimiento/                 documentos de la base de conocimiento
     conocimiento_indice.json      índice de búsqueda
     confiabot_ajustes.json        ajustes de la página
     confiabot_logo_empresa.png    logo de la empresa (opcional)
+    datos_usuarios/               cuentas y conversaciones (solo si no se usa Supabase)
 """
 from __future__ import annotations
 
@@ -1095,6 +1098,387 @@ def graficos_de_calculo(nombre: str, args: dict, res: dict):
         st.caption(f"(No se pudo dibujar el gráfico: {e})")
 
 
+# =============================================================================
+# CUENTAS DE USUARIO Y CONVERSACIONES GUARDADAS
+#   · En tu PC: se guardan en la carpeta datos_usuarios/ junto a la página.
+#   · En la nube: en Supabase (base de datos gratuita), porque los archivos de
+#     Streamlit Cloud se borran cada vez que la página se reinicia.
+# =============================================================================
+import hashlib
+import hmac
+import secrets as _secrets
+import time
+import urllib.parse
+import uuid
+from datetime import datetime, timezone
+
+CARPETA_USUARIOS = CARPETA / "datos_usuarios"
+PATRON_USUARIO = re.compile(r"^[a-z0-9._-]{3,30}$")
+ITERACIONES = 200_000
+
+
+def hash_clave(clave: str, sal: str | None = None) -> tuple[str, str]:
+    sal = sal or _secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", clave.encode("utf-8"), bytes.fromhex(sal), ITERACIONES).hex()
+    return h, sal
+
+
+def ahora_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class AlmacenLocal:
+    """Archivos JSON en una carpeta (PC del usuario)."""
+    persistente = True
+
+    def __init__(self, carpeta: Path):
+        self.carpeta = carpeta
+
+    def _u(self, usuario):
+        return self.carpeta / "usuarios" / f"{usuario}.json"
+
+    def _c(self, usuario, cid=""):
+        return self.carpeta / "conversaciones" / usuario / (f"{cid}.json" if cid else "")
+
+    def obtener_usuario(self, usuario):
+        try:
+            return json.loads(self._u(usuario).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def crear_usuario(self, datos) -> bool:
+        ruta = self._u(datos["usuario"])
+        if ruta.exists():
+            return False
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+        return True
+
+    def listar(self, usuario):
+        salida = []
+        carpeta = self._c(usuario)
+        if carpeta.exists():
+            for ruta in carpeta.glob("*.json"):
+                try:
+                    d = json.loads(ruta.read_text(encoding="utf-8"))
+                    salida.append({"id": d["id"], "titulo": d["titulo"], "actualizada": d["actualizada"]})
+                except (OSError, ValueError, KeyError):
+                    continue
+        return sorted(salida, key=lambda c: c["actualizada"], reverse=True)[:50]
+
+    def cargar(self, usuario, cid):
+        try:
+            return json.loads(self._c(usuario, cid).read_text(encoding="utf-8"))["datos"]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def guardar(self, usuario, cid, titulo, datos):
+        ruta = self._c(usuario, cid)
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_text(json.dumps({"id": cid, "titulo": titulo, "actualizada": ahora_iso(), "datos": datos},
+                                   ensure_ascii=False), encoding="utf-8")
+
+    def borrar(self, usuario, cid):
+        self._c(usuario, cid).unlink(missing_ok=True)
+
+
+class AlmacenSupabase:
+    """Tablas 'usuarios' y 'conversaciones' en Supabase, por su API REST."""
+    persistente = True
+
+    def __init__(self, url: str, clave: str):
+        self.base = url.rstrip("/") + "/rest/v1/"
+        self.cabeceras = {"apikey": clave, "Content-Type": "application/json"}
+        if clave.startswith("eyJ"):                     # clave service_role antigua (JWT)
+            self.cabeceras["Authorization"] = f"Bearer {clave}"
+
+    def _pedir(self, metodo, ruta, cuerpo=None, prefer=None):
+        cab = dict(self.cabeceras)
+        if prefer:
+            cab["Prefer"] = prefer
+        datos = json.dumps(cuerpo).encode("utf-8") if cuerpo is not None else None
+        req = urllib.request.Request(self.base + ruta, data=datos, headers=cab, method=metodo)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            texto = r.read().decode("utf-8")
+        return json.loads(texto) if texto.strip() else None
+
+    @staticmethod
+    def _q(valor):
+        return urllib.parse.quote(str(valor), safe="")
+
+    def obtener_usuario(self, usuario):
+        filas = self._pedir("GET", f"usuarios?usuario=eq.{self._q(usuario)}&select=*")
+        return filas[0] if filas else None
+
+    def crear_usuario(self, datos) -> bool:
+        try:
+            self._pedir("POST", "usuarios", datos, prefer="return=minimal")
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 409:                           # ya existe
+                return False
+            raise
+
+    def listar(self, usuario):
+        return self._pedir("GET", f"conversaciones?usuario=eq.{self._q(usuario)}"
+                                  "&select=id,titulo,actualizada&order=actualizada.desc&limit=50") or []
+
+    def cargar(self, usuario, cid):
+        filas = self._pedir("GET", f"conversaciones?id=eq.{self._q(cid)}&usuario=eq.{self._q(usuario)}&select=datos")
+        return filas[0]["datos"] if filas else None
+
+    def guardar(self, usuario, cid, titulo, datos):
+        self._pedir("POST", "conversaciones?on_conflict=id",
+                    {"id": cid, "usuario": usuario, "titulo": titulo, "actualizada": ahora_iso(), "datos": datos},
+                    prefer="resolution=merge-duplicates,return=minimal")
+
+    def borrar(self, usuario, cid):
+        self._pedir("DELETE", f"conversaciones?id=eq.{self._q(cid)}&usuario=eq.{self._q(usuario)}")
+
+
+def crear_almacen():
+    url, clave = secreto("SUPABASE_URL"), secreto("SUPABASE_KEY")
+    if url and clave:
+        return AlmacenSupabase(url, clave)
+    almacen = AlmacenLocal(CARPETA_USUARIOS)
+    almacen.persistente = not EN_NUBE            # en la nube sin Supabase, se borra al reiniciar
+    return almacen
+
+
+# ---------------------------------------------------------------- operaciones de cuenta
+def registrar(usuario: str, nombre: str, clave: str, clave2: str) -> str | None:
+    """Devuelve un mensaje de error, o None si se creó la cuenta."""
+    usuario = usuario.strip().lower()
+    if not PATRON_USUARIO.match(usuario):
+        return "El usuario debe tener de 3 a 30 caracteres: letras minúsculas, números, punto, guion o guion bajo."
+    if len(nombre.strip()) < 2:
+        return "Escribe tu nombre."
+    if len(clave) < 6:
+        return "La contraseña debe tener al menos 6 caracteres."
+    if clave != clave2:
+        return "Las contraseñas no coinciden."
+    h, sal = hash_clave(clave)
+    if not ALMACEN.crear_usuario({"usuario": usuario, "nombre": nombre.strip()[:60], "hash": h, "sal": sal,
+                                  "creado": ahora_iso()}):
+        return "Ese nombre de usuario ya existe. Elige otro."
+    return None
+
+
+def verificar(usuario: str, clave: str):
+    """Devuelve los datos del usuario si la contraseña es correcta."""
+    datos = ALMACEN.obtener_usuario(usuario.strip().lower())
+    if not datos:
+        hash_clave(clave)                        # mismo tiempo de respuesta exista o no el usuario
+        return None
+    h, _ = hash_clave(clave, datos["sal"])
+    return datos if hmac.compare_digest(h, datos["hash"]) else None
+
+
+def iniciar_sesion(datos_usuario: dict):
+    st.session_state.usuario = {"usuario": datos_usuario["usuario"], "nombre": datos_usuario["nombre"]}
+    st.session_state.invitado = False
+    nueva_conversacion()
+
+
+def cerrar_sesion():
+    for k in ("usuario", "invitado", "conv_id", "lista_conv"):
+        st.session_state.pop(k, None)
+    nueva_conversacion()
+
+
+def nueva_conversacion():
+    st.session_state.agente = AgenteWeb()
+    st.session_state.chat = []
+    st.session_state.n_calculos = 0
+    st.session_state.conv_id = None
+
+
+def _usuario_actual():
+    u = st.session_state.get("usuario")
+    return u["usuario"] if u else None
+
+
+def lista_conversaciones(forzar: bool = False):
+    usuario = _usuario_actual()
+    if not usuario:
+        return []
+    if forzar or "lista_conv" not in st.session_state:
+        try:
+            st.session_state.lista_conv = ALMACEN.listar(usuario)
+        except Exception as e:
+            print("Error al listar conversaciones:", e)
+            st.session_state.lista_conv = []
+    return st.session_state.lista_conv
+
+
+def guardar_conversacion_actual():
+    usuario = _usuario_actual()
+    if not usuario or not st.session_state.chat:
+        return
+    if not st.session_state.get("conv_id"):
+        st.session_state.conv_id = uuid.uuid4().hex
+    primera = next((t for r, t, *_ in st.session_state.chat if r == "user"), "Conversación")
+    titulo = re.sub(r"\s+", " ", primera).strip()
+    titulo = titulo[:60] + ("…" if len(titulo) > 60 else "")
+    datos = {"chat": [list(m) for m in st.session_state.chat],
+             "mensajes": st.session_state.agente.mensajes[1:],          # sin el mensaje de sistema
+             "n_calculos": st.session_state.n_calculos}
+    try:
+        ALMACEN.guardar(usuario, st.session_state.conv_id, titulo, datos)
+        lista_conversaciones(forzar=True)
+    except Exception as e:
+        print("Error al guardar conversación:", e)
+        st.toast("⚠️ No se pudo guardar la conversación. Revisa la conexión con la base de datos.")
+
+
+def abrir_conversacion(cid: str):
+    try:
+        datos = ALMACEN.cargar(_usuario_actual(), cid)
+    except Exception as e:
+        print("Error al abrir conversación:", e)
+        datos = None
+    if not datos:
+        st.toast("⚠️ No se pudo abrir esa conversación.")
+        return
+    agente = AgenteWeb()
+    agente.mensajes += datos.get("mensajes", [])
+    st.session_state.agente = agente
+    st.session_state.chat = [tuple(m) for m in datos.get("chat", [])]
+    st.session_state.n_calculos = datos.get("n_calculos", 0)
+    st.session_state.conv_id = cid
+    st.session_state["_ir"] = "💬 Asistente"
+
+
+def borrar_conversacion(cid: str):
+    try:
+        ALMACEN.borrar(_usuario_actual(), cid)
+    except Exception as e:
+        print("Error al borrar conversación:", e)
+        st.toast("⚠️ No se pudo borrar la conversación.")
+        return
+    if st.session_state.get("conv_id") == cid:
+        nueva_conversacion()
+    lista_conversaciones(forzar=True)
+
+
+def fecha_corta(iso: str) -> str:
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except (ValueError, AttributeError):
+        return ""
+    hoy = datetime.now().astimezone().date()
+    if d.date() == hoy:
+        return f"Hoy {d:%H:%M}"
+    if (hoy - d.date()).days == 1:
+        return "Ayer"
+    return f"{d:%d/%m/%Y}"
+
+
+# ---------------------------------------------------------------- pantalla de acceso
+def pantalla_acceso():
+    _, centro, _ = st.columns([1, 1.6, 1])
+    with centro:
+        st.markdown(f"""<div class="cb-login-cab">{img_svg(LOGO, 64)}
+            <h2>{AJ['nombre_asistente']}</h2>
+            <p>Tu asistente de Ingeniería de Confiabilidad. Inicia sesión para guardar tus conversaciones
+            y retomarlas cuando quieras.</p></div>""", unsafe_allow_html=True)
+        if not ALMACEN.persistente:
+            st.warning("La base de datos permanente no está configurada: las cuentas y conversaciones se borrarán "
+                       "cuando la página se reinicie.")
+        bloqueo = st.session_state.get("bloqueo_hasta", 0) - time.time()
+        with st.container(border=True, key="cb_login"):
+            entrar, crear = st.tabs(["🔑 Iniciar sesión", "✨ Crear cuenta"])
+            with entrar:
+                with st.form("form_login"):
+                    usuario = st.text_input("Usuario", placeholder="tu_usuario")
+                    clave = st.text_input("Contraseña", type="password")
+                    enviado = st.form_submit_button("Iniciar sesión", use_container_width=True)
+                if enviado:
+                    if bloqueo > 0:
+                        st.error(f"Demasiados intentos. Espera {int(bloqueo) + 1} segundos.")
+                    else:
+                        try:
+                            datos = verificar(usuario, clave) if usuario and clave else None
+                        except Exception as e:
+                            print("Error de inicio de sesión:", e)
+                            st.error("No se pudo conectar con la base de datos. Intenta de nuevo.")
+                            datos = False
+                        if datos:
+                            st.session_state.intentos = 0
+                            iniciar_sesion(datos)
+                            st.rerun()
+                        elif datos is None:
+                            st.session_state.intentos = st.session_state.get("intentos", 0) + 1
+                            if st.session_state.intentos >= 5:
+                                st.session_state.bloqueo_hasta = time.time() + 30
+                                st.session_state.intentos = 0
+                            st.error("Usuario o contraseña incorrectos.")
+            with crear:
+                with st.form("form_registro"):
+                    nombre = st.text_input("Tu nombre", placeholder="Ej.: Aldair")
+                    nuevo = st.text_input("Usuario", placeholder="minúsculas, sin espacios",
+                                          help="De 3 a 30 caracteres: letras, números, punto, guion o guion bajo.")
+                    c1, c2 = st.columns(2)
+                    clave1 = c1.text_input("Contraseña", type="password", help="Mínimo 6 caracteres.")
+                    clave2 = c2.text_input("Repetir contraseña", type="password")
+                    crear_ok = st.form_submit_button("Crear cuenta", use_container_width=True)
+                if crear_ok:
+                    try:
+                        error = registrar(nuevo, nombre, clave1, clave2)
+                    except Exception as e:
+                        print("Error de registro:", e)
+                        error = "No se pudo conectar con la base de datos. Intenta de nuevo."
+                    if error:
+                        st.error(error)
+                    else:
+                        iniciar_sesion(ALMACEN.obtener_usuario(nuevo.strip().lower()))
+                        st.rerun()
+        st.markdown('<div class="cb-login-sep">o</div>', unsafe_allow_html=True)
+        if st.button("Continuar como invitado", use_container_width=True,
+                     help="Puedes usar el agente, pero tus conversaciones no se guardarán."):
+            st.session_state.invitado = True
+            st.rerun()
+        st.markdown('<div class="cb-pie" style="text-align:center">Las contraseñas se guardan cifradas '
+                    '(PBKDF2-SHA256). Nadie, ni el administrador, puede leerlas.</div>', unsafe_allow_html=True)
+
+
+def barra_usuario():
+    """Tarjeta del usuario y su historial de conversaciones (barra lateral)."""
+    u = st.session_state.get("usuario")
+    if not u:
+        st.markdown('<div class="cb-user"><div class="cb-avatar">?</div><div><b>Invitado</b>'
+                    '<span>Tus conversaciones no se guardan</span></div></div>', unsafe_allow_html=True)
+        if st.button("🔑 Iniciar sesión o crear cuenta", use_container_width=True):
+            cerrar_sesion()
+            st.rerun()
+        return
+    iniciales = "".join(p[0] for p in u["nombre"].split()[:2]).upper() or "U"
+    st.markdown(f'<div class="cb-user"><div class="cb-avatar">{iniciales}</div><div><b>{u["nombre"]}</b>'
+                f'<span>@{u["usuario"]}</span></div></div>', unsafe_allow_html=True)
+
+
+def historial_conversaciones():
+    if not st.session_state.get("usuario"):
+        return
+    conversaciones = lista_conversaciones()
+    st.markdown('<div class="cb-seccion">Mis conversaciones</div>', unsafe_allow_html=True)
+    if not conversaciones:
+        st.caption("Aún no tienes conversaciones guardadas. Se guardan solas al preguntar.")
+        return
+    actual = st.session_state.get("conv_id")
+    with st.container(key="cb_historial", height=min(320, 52 * len(conversaciones) + 10), border=False):
+        for c in conversaciones:
+            col1, col2 = st.columns([5, 1], vertical_alignment="center")
+            col1.button(("● " if c["id"] == actual else "") + c["titulo"], key=f"conv_{c['id']}",
+                        help=fecha_corta(c["actualizada"]), use_container_width=True,
+                        type="primary" if c["id"] == actual else "secondary",
+                        on_click=abrir_conversacion, args=(c["id"],))
+            with col2.popover("🗑️", use_container_width=True):
+                st.caption("¿Borrar esta conversación?")
+                st.button("Borrar", key=f"del_{c['id']}", type="primary",
+                          on_click=borrar_conversacion, args=(c["id"],))
+
+
 # ---------------------------------------------------------------- estado y ajustes
 st.set_page_config(page_title=f"{cargar_ajustes()['nombre_asistente']} · Confiabilidad", page_icon="⚙️",
                    layout="wide", initial_sidebar_state="expanded")
@@ -1117,6 +1501,7 @@ EN_NUBE = bool(GEMINI_API_KEY)                 # con clave de Gemini = versión 
 CLAVE_ADMIN = secreto("CLAVE_ADMIN")           # si existe, se activa el modo compañeros
 st.session_state.setdefault("admin", not CLAVE_ADMIN)
 ES_ADMIN = st.session_state.admin
+ALMACEN = crear_almacen()
 TEMPERATURA = float(AJ["temperatura"])
 CONTEXTO = int(AJ["contexto"])
 URL_OLLAMA = AJ["servidor"].rstrip("/") + "/api/chat"
@@ -1237,6 +1622,23 @@ code { font-family: 'JetBrains Mono', monospace !important; }
 [data-testid="stChatInput"] textarea { font-size: .95rem; }
 [data-testid="stChatInput"]:focus-within { box-shadow: 0 0 0 2px color-mix(in srgb, var(--cb-a) 60%, transparent); }
 
+/* ---------- acceso y usuario ---------- */
+.cb-login-cab { text-align: center; padding: 34px 0 10px; }
+.cb-login-cab h2 { font-weight: 800; margin: 12px 0 6px; font-size: 1.7rem; }
+.cb-login-cab p { color: var(--cb-texto2); font-size: .92rem; margin: 0 auto 6px; max-width: 420px; }
+.st-key-cb_login { border-radius: 20px !important; padding: 6px 8px; background: var(--cb-suave);
+  box-shadow: 0 20px 50px -30px rgba(0,0,0,.6); }
+.cb-login-sep { text-align: center; color: var(--cb-texto2); font-size: .8rem; margin: 10px 0; }
+.cb-user { display:flex; align-items:center; gap:10px; padding: 10px 12px; border-radius: 14px;
+  border: 1px solid var(--cb-borde); background: var(--cb-suave); margin-top: 10px; }
+.cb-user b { display:block; font-size: .9rem; line-height: 1.2; }
+.cb-user span { display:block; font-size: .72rem; color: var(--cb-texto2); }
+.cb-avatar { width: 36px; height: 36px; border-radius: 50%; display:grid; place-items:center; flex-shrink: 0;
+  font-weight: 800; font-size: .85rem; color: #fff; background: linear-gradient(135deg, #2E86AB, var(--cb-a)); }
+.st-key-cb_historial .stButton > button { justify-content: flex-start; text-align: left; font-weight: 500;
+  font-size: .82rem; padding: 6px 10px; min-height: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st-key-cb_historial .stButton > button p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 @media (max-width: 640px) {
   .cb-header { padding: 16px 18px; border-radius: 16px; } .cb-header h1 { font-size: 1.15rem; }
   .cb-der { margin-left: 0; } .cb-hero { padding-top: 10px; } .cb-kpi b { font-size: 1.2rem; }
@@ -1249,6 +1651,13 @@ st.markdown(CSS.replace("%PRINCIPAL%", AJ["color_principal"]).replace("%ACENTO%"
 LOGO = logo_svg(AJ["color_principal"], AJ["color_acento"])
 LOGO_HEADER = logo_svg("#FFFFFF00", AJ["color_acento"]).replace('fill="url(#g)"', 'fill="rgba(255,255,255,.12)"')
 
+# ---------------------------------------------------------------- acceso
+if not st.session_state.get("usuario") and not st.session_state.get("invitado"):
+    st.markdown('<style>[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],'
+                '[data-testid="stExpandSidebarButton"] { display: none; }</style>', unsafe_allow_html=True)
+    pantalla_acceso()
+    st.stop()
+
 # ---------------------------------------------------------------- barra lateral
 with st.sidebar:
     st.markdown(f"""<div class="cb-marca">{img_svg(LOGO, 46)}
@@ -1256,6 +1665,7 @@ with st.sidebar:
                 unsafe_allow_html=True)
     if ARCHIVO_LOGO.exists():
         st.markdown(img_logo_empresa(46), unsafe_allow_html=True)
+    barra_usuario()
     st.divider()
     paginas = (["💬 Asistente", "🧮 Calculadoras", "📚 Conocimiento", "⚙️ Ajustes", "ℹ️ Acerca de"] if ES_ADMIN
                else ["💬 Asistente", "🧮 Calculadoras", "ℹ️ Acerca de"])
@@ -1266,18 +1676,18 @@ with st.sidebar:
     st.radio("Navegación", paginas, key="pagina", label_visibility="collapsed")
     st.divider()
     if st.button("➕ Nueva conversación", use_container_width=True, type="primary"):
-        st.session_state.agente = AgenteWeb()
-        st.session_state.chat = []
-        st.session_state.n_calculos = 0
+        nueva_conversacion()
         st.session_state["_ir"] = "💬 Asistente"
         st.rerun()
+    historial_conversaciones()
+    st.divider()
     st.download_button("⬇️ Descargar conversación", data=conversacion_markdown(st.session_state.chat, AJ),
                        file_name=f"conversacion_{datetime.now():%Y%m%d_%H%M}.md", mime="text/markdown",
                        use_container_width=True, disabled=not st.session_state.chat)
-    c1, c2 = st.columns(2)
-    c1.metric("Consultas", sum(1 for r, *_ in st.session_state.chat if r == "user"))
-    c2.metric("Cálculos", st.session_state.n_calculos)
-    st.metric("Documentos en la base", len([a for a in BASE.archivos.values() if not a.get("error")]))
+    if st.session_state.get("usuario"):
+        if st.button("🚪 Cerrar sesión", use_container_width=True):
+            cerrar_sesion()
+            st.rerun()
     if CLAVE_ADMIN:
         with st.expander("🔐 Administrador" + (" (activo)" if ES_ADMIN else "")):
             if ES_ADMIN:
@@ -1394,6 +1804,7 @@ def responder(pregunta: str):
         st.markdown(respuesta)
     st.session_state.n_calculos += len(agente.registro)
     st.session_state.chat.append(("assistant", respuesta, list(agente.registro), fuentes))
+    guardar_conversacion_actual()
 
 
 # ---------------------------------------------------------------- página: Ajustes
