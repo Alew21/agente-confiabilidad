@@ -882,6 +882,7 @@ def mostrar_calculos(calculos):
                     anidados = {k: v for k, v in res.items() if isinstance(v, (dict, list))}
                     if anidados:
                         st.json(anidados, expanded=False)
+        graficos_de_calculo(nombre, args, res)
 
 
 def conversacion_markdown(chat, aj) -> str:
@@ -890,6 +891,208 @@ def conversacion_markdown(chat, aj) -> str:
     for rol, texto, *_ in chat:
         lineas.append(f"## {'Usuario' if rol == 'user' else aj['nombre_asistente']}\n\n{texto}\n")
     return "\n".join(lineas)
+
+
+# =============================================================================
+# GRÁFICOS (Vega-Lite nativo de Streamlit: sin librerías adicionales)
+# =============================================================================
+PALETA = ["#2E86AB", "#F4A261", "#E76F51", "#2A9D8F", "#8E7DBE"]
+VL_SCHEMA = "https://vega.github.io/schema/vega-lite/v5.json"
+
+
+def leer_numeros(texto: str) -> list[float]:
+    """Convierte '1200, 1850; 2100 2600' (o una columna pegada de Excel) en números positivos."""
+    valores = []
+    for parte in re.split(r"[\s;,]+", (texto or "").strip()):
+        if not parte:
+            continue
+        try:
+            v = float(parte)
+        except ValueError:
+            continue
+        if v > 0:
+            valores.append(v)
+    return valores
+
+
+def rangos_weibull(fallas: list[float], suspensiones: list[float]) -> list[tuple[float, float]]:
+    """(tiempo, F) de cada falla con rangos ajustados de Johnson y rango de mediana de Bernard."""
+    datos = sorted([(t, True) for t in fallas] + [(t, False) for t in suspensiones])
+    n, prev, puntos = len(datos), 0.0, []
+    for i, (t, es_falla) in enumerate(datos):
+        if es_falla:
+            rango = prev + (n + 1 - prev) / (1 + (n - i))
+            prev = rango
+            puntos.append((t, (rango - 0.3) / (n + 0.4)))
+    return puntos
+
+
+def _y_weibull(f: float) -> float:
+    return math.log(-math.log(1 - f))
+
+
+def _tiempos(maximo: float, n: int = 120) -> list[float]:
+    return [maximo * i / n for i in range(1, n + 1)]
+
+
+def spec_probabilidad_weibull(fallas, suspensiones, beta, eta) -> dict:
+    puntos = rangos_weibull(fallas, suspensiones)
+    tmin, tmax = min(t for t, _ in puntos), max(t for t, _ in puntos)
+    t0, t1 = tmin * 0.5, max(tmax * 1.6, eta * 1.3)
+    linea = []
+    for i in range(61):
+        t = t0 * (t1 / t0) ** (i / 60)
+        y = beta * (math.log(t) - math.log(eta))
+        if -6.2 < y < 2.0:
+            linea.append({"t": t, "y": y, "F": 1 - math.exp(-math.exp(y))})
+    ticks_f = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.632, 0.8, 0.9, 0.95, 0.99, 0.999]
+    datos = [{"t": round(t, 3), "y": _y_weibull(f), "F": f} for t, f in puntos]
+    X = {"field": "t", "type": "quantitative", "scale": {"type": "log"}, "title": "Tiempo"}
+    Y = {"field": "y", "type": "quantitative", "scale": {"zero": False}, "title": "Probabilidad de falla F(t)",
+         "axis": {"values": [_y_weibull(f) for f in ticks_f],
+                  "labelExpr": "format(1 - exp(-exp(datum.value)), '.1%')"}}
+    tooltip = [{"field": "t", "type": "quantitative", "title": "Tiempo", "format": ",.1f"},
+               {"field": "F", "type": "quantitative", "title": "F(t)", "format": ".1%"}]
+    return {
+        "$schema": VL_SCHEMA, "height": 320,
+        "title": {"text": f"Gráfico de probabilidad Weibull · β = {beta:.2f}, η = {eta:,.0f}", "anchor": "start"},
+        "layer": [
+            {"data": {"values": [{"y": 0.0}]}, "mark": {"type": "rule", "strokeDash": [4, 4], "opacity": 0.6},
+             "encoding": {"y": Y, "color": {"value": PALETA[1]}}},
+            {"data": {"values": linea}, "mark": {"type": "line", "strokeWidth": 2.5},
+             "encoding": {"x": X, "y": Y, "color": {"value": PALETA[0]}, "tooltip": tooltip}},
+            {"data": {"values": datos}, "mark": {"type": "point", "filled": True, "size": 80, "opacity": 1},
+             "encoding": {"x": X, "y": Y, "color": {"value": PALETA[2]}, "tooltip": tooltip}},
+        ],
+    }
+
+
+def spec_curvas_confiabilidad(beta, eta, marcar_t=None) -> dict:
+    tmax = eta * (-math.log(0.01)) ** (1 / beta)          # tiempo donde R = 1 %
+    if marcar_t:
+        tmax = max(tmax, marcar_t * 1.15)
+    filas = []
+    for t in _tiempos(tmax):
+        r = math.exp(-((t / eta) ** beta))
+        filas.append({"t": t, "Curva": "Confiabilidad R(t)", "valor": r})
+        filas.append({"t": t, "Curva": "Prob. de falla F(t)", "valor": 1 - r})
+    X = {"field": "t", "type": "quantitative", "title": "Tiempo"}
+    Y = {"field": "valor", "type": "quantitative", "title": None, "axis": {"format": "%"},
+         "scale": {"domain": [0, 1]}}
+    capas = [{"data": {"values": filas}, "mark": {"type": "line", "strokeWidth": 2.5},
+              "encoding": {"x": X, "y": Y,
+                           "color": {"field": "Curva", "type": "nominal",
+                                     "scale": {"range": [PALETA[0], PALETA[2]]},
+                                     "legend": {"orient": "bottom", "title": None}},
+                           "tooltip": [{"field": "Curva", "type": "nominal"},
+                                       {"field": "t", "type": "quantitative", "format": ",.0f", "title": "Tiempo"},
+                                       {"field": "valor", "type": "quantitative", "format": ".1%", "title": "Valor"}]}}]
+    if marcar_t:
+        r = math.exp(-((marcar_t / eta) ** beta))
+        capas.append({"data": {"values": [{"t": marcar_t, "valor": r, "txt": f"R = {r:.1%}"}]},
+                      "layer": [{"mark": {"type": "rule", "strokeDash": [4, 4]},
+                                 "encoding": {"x": X, "color": {"value": PALETA[1]}}},
+                                {"mark": {"type": "point", "filled": True, "size": 90, "opacity": 1},
+                                 "encoding": {"x": X, "y": Y, "color": {"value": PALETA[1]}}},
+                                {"mark": {"type": "text", "dx": 8, "dy": -10, "align": "left", "fontWeight": 600},
+                                 "encoding": {"x": X, "y": Y, "text": {"field": "txt", "type": "nominal"},
+                                              "color": {"value": PALETA[1]}}}]})
+    return {"$schema": VL_SCHEMA, "height": 300,
+            "title": {"text": "Curvas de confiabilidad", "anchor": "start"}, "layer": capas}
+
+
+def spec_tasa_falla(beta, eta) -> dict:
+    tmax = eta * (-math.log(0.01)) ** (1 / beta)
+    filas = [{"t": t, "h": (beta / eta) * (t / eta) ** (beta - 1)} for t in _tiempos(tmax)]
+    if beta < 1:                                          # evita el infinito en t→0
+        filas = filas[2:]
+    return {"$schema": VL_SCHEMA, "height": 300,
+            "title": {"text": "Tasa de falla h(t)", "anchor": "start"},
+            "data": {"values": filas},
+            "mark": {"type": "area", "line": {"color": PALETA[3], "strokeWidth": 2.5},
+                     "color": PALETA[3], "opacity": 0.25},
+            "encoding": {"x": {"field": "t", "type": "quantitative", "title": "Tiempo"},
+                         "y": {"field": "h", "type": "quantitative", "title": "Fallas por unidad de tiempo",
+                               "axis": {"format": ".1e"}},
+                         "tooltip": [{"field": "t", "type": "quantitative", "format": ",.0f", "title": "Tiempo"},
+                                     {"field": "h", "type": "quantitative", "format": ".3e", "title": "h(t)"}]}}
+
+
+def curva_costo(beta, eta, cp, cf, n: int = 90) -> list[dict]:
+    filas = []
+    for t in _tiempos(eta * 2.2, n):
+        r = math.exp(-((t / eta) ** beta))
+        filas.append({"T": t, "costo": (cp * r + cf * (1 - r)) / _integral_r(beta, eta, t, 200)})
+    return filas
+
+
+def spec_costo_reemplazo(beta, eta, cp, cf, resultado: dict) -> dict:
+    rtf = resultado["costo_por_unidad_tiempo_operar_hasta_falla"]
+    filas = [f for f in curva_costo(beta, eta, cp, cf) if f["costo"] <= rtf * 2.2]
+    optimo = {"T": resultado["intervalo_optimo"], "costo": resultado["costo_por_unidad_tiempo_optimo"],
+              "txt": f"Óptimo: {resultado['intervalo_optimo']:,.0f}"}
+    X = {"field": "T", "type": "quantitative", "title": "Intervalo de reemplazo"}
+    Y = {"field": "costo", "type": "quantitative", "title": "Costo por unidad de tiempo", "scale": {"zero": False}}
+    return {"$schema": VL_SCHEMA, "height": 320,
+            "title": {"text": "Costo según el intervalo de reemplazo", "anchor": "start"},
+            "layer": [
+                {"data": {"values": filas}, "mark": {"type": "line", "strokeWidth": 2.5},
+                 "encoding": {"x": X, "y": Y, "color": {"value": PALETA[0]},
+                              "tooltip": [{"field": "T", "type": "quantitative", "format": ",.0f", "title": "Intervalo"},
+                                          {"field": "costo", "type": "quantitative", "format": ",.3f", "title": "Costo"}]}},
+                {"data": {"values": [{"costo": rtf, "txt": "Operar hasta la falla"}]},
+                 "layer": [{"mark": {"type": "rule", "strokeDash": [5, 4]},
+                            "encoding": {"y": Y, "color": {"value": PALETA[2]}}},
+                           {"mark": {"type": "text", "align": "right", "dy": -8, "x": "width", "fontWeight": 600},
+                            "encoding": {"y": Y, "text": {"field": "txt", "type": "nominal"},
+                                         "color": {"value": PALETA[2]}}}]},
+                {"data": {"values": [optimo]},
+                 "layer": [{"mark": {"type": "point", "filled": True, "size": 140, "opacity": 1},
+                            "encoding": {"x": X, "y": Y, "color": {"value": PALETA[1]}}},
+                           {"mark": {"type": "text", "dy": 18, "fontWeight": 700},
+                            "encoding": {"x": X, "y": Y, "text": {"field": "txt", "type": "nominal"},
+                                         "color": {"value": PALETA[1]}}}]},
+            ]}
+
+
+def spec_pareto_rpn(ranking: list[dict]) -> dict:
+    colores = {"ALTA": PALETA[2], "MEDIA": PALETA[1], "BAJA": PALETA[3]}
+    datos = [{"modo": r["modo"], "RPN": r["RPN"], "nivel": r["prioridad"].split()[0]} for r in ranking]
+    return {"$schema": VL_SCHEMA, "height": max(160, 36 * len(datos)),
+            "title": {"text": "Pareto de riesgo (RPN)", "anchor": "start"},
+            "data": {"values": datos},
+            "mark": {"type": "bar", "cornerRadiusEnd": 6},
+            "encoding": {"y": {"field": "modo", "type": "nominal", "sort": "-x", "title": None,
+                               "axis": {"labelLimit": 260}},
+                         "x": {"field": "RPN", "type": "quantitative", "scale": {"domain": [0, 1000]}},
+                         "color": {"field": "nivel", "type": "nominal", "title": "Prioridad",
+                                   "scale": {"domain": list(colores), "range": list(colores.values())},
+                                   "legend": {"orient": "bottom"}},
+                         "tooltip": [{"field": "modo", "type": "nominal", "title": "Modo"},
+                                     {"field": "RPN", "type": "quantitative"},
+                                     {"field": "nivel", "type": "nominal", "title": "Prioridad"}]}}
+
+
+def grafico(spec: dict):
+    st.vega_lite_chart(None, spec, use_container_width=True)
+
+
+def graficos_de_calculo(nombre: str, args: dict, res: dict):
+    """Gráficos automáticos para los cálculos que hace el agente en el chat."""
+    try:
+        if nombre == "ajuste_weibull" and "beta_forma" in res:
+            grafico(spec_probabilidad_weibull(args.get("tiempos_falla", []), args.get("tiempos_suspension") or [],
+                                              res["beta_forma"], res["eta_escala"]))
+            grafico(spec_curvas_confiabilidad(res["beta_forma"], res["eta_escala"]))
+        elif nombre == "confiabilidad_weibull" and "R_confiabilidad_%" in res:
+            grafico(spec_curvas_confiabilidad(float(args["beta"]), float(args["eta"]), float(args["tiempo"])))
+        elif nombre == "intervalo_optimo_reemplazo" and "intervalo_optimo" in res:
+            grafico(spec_costo_reemplazo(float(args["beta"]), float(args["eta"]), float(args["costo_preventivo"]),
+                                         float(args["costo_correctivo"]), res))
+        elif nombre == "calcular_rpn" and res.get("ranking"):
+            grafico(spec_pareto_rpn(res["ranking"]))
+    except Exception as e:                                  # un gráfico nunca debe romper el chat
+        st.caption(f"(No se pudo dibujar el gráfico: {e})")
 
 
 # ---------------------------------------------------------------- estado y ajustes
@@ -935,52 +1138,129 @@ st.session_state.agente.mensajes[0]["content"] = prompt_sistema(AJ)
 # ---------------------------------------------------------------- estilos
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html, body, .stApp, .stMarkdown, button, input, textarea, select { font-family: 'Inter', sans-serif !important; }
-#MainMenu, footer, .stDeployButton, [data-testid="stAppDeployButton"], [data-testid="stToolbarActions"]
-  { visibility: hidden; display: none; }
-.block-container { padding-top: 1.6rem; max-width: 1100px; }
-.cb-header { display:flex; align-items:center; flex-wrap:wrap; gap:16px; padding:18px 22px; border-radius:16px;
-  background: linear-gradient(120deg, %PRINCIPAL% 0%, %PRINCIPAL% 55%, #2E86AB 100%); color:#fff; margin-bottom:20px;
-  box-shadow: 0 6px 20px rgba(31,56,100,.18); }
-.cb-header h1 { font-size:1.55rem; font-weight:700; margin:0; padding:0; color:#fff; line-height:1.25; }
-.cb-sub { opacity:.85; font-size:.9rem; margin-top:2px; }
-.cb-der { margin-left:auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
-.cb-pill { background: rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.25); padding:6px 12px;
-  border-radius:999px; font-size:.8rem; white-space:nowrap; }
-.cb-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap');
+:root { --cb-p: %PRINCIPAL%; --cb-a: %ACENTO%; --cb-borde: rgba(127,127,127,.20); --cb-suave: rgba(127,127,127,.07);
+        --cb-texto2: rgba(127,127,127,.95); --cb-radio: 16px; }
+html, body, .stApp, .stMarkdown, button, input, textarea, select, [data-testid="stMarkdownContainer"]
+  { font-family: 'Plus Jakarta Sans', system-ui, sans-serif !important; }
+#MainMenu, footer, .stDeployButton, [data-testid="stAppDeployButton"], [data-testid="stToolbarActions"],
+[data-testid="stDecoration"] { visibility: hidden; display: none; }
+header[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top: 1.4rem; padding-bottom: 6rem; max-width: 1140px; }
+h1, h2, h3, h4, h5 { letter-spacing: -.01em; }
+
+/* ---------- encabezado ---------- */
+.cb-header { position: relative; overflow: hidden; display:flex; align-items:center; flex-wrap:wrap; gap:16px;
+  padding: 20px 24px; border-radius: 20px; color:#fff; margin-bottom: 22px;
+  background: radial-gradient(1200px 300px at 100% 0%, rgba(46,134,171,.55), transparent 60%),
+              linear-gradient(125deg, var(--cb-p) 0%, color-mix(in srgb, var(--cb-p) 70%, #0b1220) 100%);
+  box-shadow: 0 10px 30px -12px rgba(15,30,60,.45), inset 0 1px 0 rgba(255,255,255,.08); }
+.cb-header::after { content:""; position:absolute; inset:0; pointer-events:none; opacity:.35;
+  background-image: radial-gradient(rgba(255,255,255,.18) 1px, transparent 1px); background-size: 18px 18px;
+  mask-image: linear-gradient(90deg, transparent 40%, #000); -webkit-mask-image: linear-gradient(90deg, transparent 40%, #000); }
+.cb-header h1 { font-size: 1.5rem; font-weight: 800; margin: 0; padding: 0; color: #fff; line-height: 1.2; }
+.cb-sub { opacity: .82; font-size: .88rem; margin-top: 3px; }
+.cb-der { margin-left: auto; display:flex; align-items:center; gap:12px; flex-wrap:wrap; position: relative; z-index: 1; }
+.cb-pill { background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.22); padding: 6px 12px;
+  border-radius: 999px; font-size: .78rem; white-space: nowrap; backdrop-filter: blur(6px); }
+.cb-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle;
+  box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
 .cb-logo-empresa { background:#fff; border-radius:10px; padding:6px 10px; }
-.cb-marca { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
-.cb-marca b { font-size:1.15rem; color:%PRINCIPAL%; }
-.cb-marca span { display:block; font-size:.75rem; color:#6b7280; }
-.cb-bienvenida { text-align:center; padding:10px 0 4px; }
-.cb-bienvenida h3 { color:%PRINCIPAL%; margin-bottom:4px; }
-.cb-bienvenida p { color:#6b7280; margin-top:0; }
-.stButton > button { border-radius:10px; border:1px solid #d9dee8; font-weight:500; transition: all .15s; }
-.stButton > button:hover { border-color:%PRINCIPAL%; color:%PRINCIPAL%; transform: translateY(-1px); }
-.stButton > button[kind="primary"], .stFormSubmitButton > button { background:%PRINCIPAL%; border-color:%PRINCIPAL%; color:#fff; }
-.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button:hover { color:#fff; filter:brightness(1.15); }
-[data-testid="stChatMessage"] { border-radius:14px; padding:12px 16px; }
-[data-testid="stSidebar"] { border-right:1px solid #e5e7eb; }
-.cb-pie { font-size:.75rem; color:#9ca3af; margin-top:12px; }
-@media (max-width: 640px) { .cb-header h1 { font-size:1.2rem; } .cb-der { margin-left:0; } }
+
+/* ---------- barra lateral ---------- */
+[data-testid="stSidebar"] { border-right: 1px solid var(--cb-borde); }
+.cb-marca { display:flex; align-items:center; gap:12px; margin: 2px 0 4px; }
+.cb-marca b { font-size: 1.05rem; font-weight: 800; line-height: 1.2; display:block; }
+.cb-marca span { display:block; font-size: .74rem; color: var(--cb-texto2); margin-top: 2px; }
+[data-testid="stSidebar"] [role="radiogroup"] { gap: 4px; }
+[data-testid="stSidebar"] [role="radiogroup"] label { padding: 8px 12px; border-radius: 10px; width: 100%;
+  transition: background .15s; }
+[data-testid="stSidebar"] [role="radiogroup"] label:hover { background: var(--cb-suave); }
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+  background: color-mix(in srgb, var(--cb-a) 18%, transparent); font-weight: 700; }
+.cb-pie { font-size: .72rem; color: var(--cb-texto2); margin-top: 14px; line-height: 1.6; }
+
+/* ---------- portada ---------- */
+.cb-hero { text-align: center; padding: 26px 8px 8px; }
+.cb-hero .cb-eyebrow { display:inline-block; font-size:.72rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase;
+  padding: 5px 12px; border-radius: 999px; border: 1px solid var(--cb-borde); background: var(--cb-suave); }
+.cb-hero h2 { font-size: clamp(1.6rem, 4vw, 2.4rem); font-weight: 800; margin: 14px 0 6px; line-height: 1.15; }
+.cb-hero h2 em { font-style: normal; background: linear-gradient(90deg, #2E86AB, var(--cb-a));
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.cb-hero p { color: var(--cb-texto2); max-width: 620px; margin: 0 auto; font-size: .98rem; }
+.cb-chips { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin: 16px 0 22px; }
+.cb-chip { font-size:.75rem; padding: 5px 11px; border-radius: 999px; border:1px solid var(--cb-borde); }
+.cb-seccion { font-size:.74rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  color: var(--cb-texto2); margin: 8px 2px 10px; }
+.cb-features { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 22px 0 6px; }
+.cb-feature { border:1px solid var(--cb-borde); border-radius: var(--cb-radio); padding: 16px 18px; background: var(--cb-suave); }
+.cb-feature b { display:block; font-size: .95rem; margin: 6px 0 4px; }
+.cb-feature span { font-size: .82rem; color: var(--cb-texto2); line-height: 1.5; }
+.cb-feature i { font-style: normal; font-size: 1.3rem; }
+
+/* ---------- tarjetas de resultado ---------- */
+.cb-kpis { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 6px 0 14px; }
+.cb-kpi { border:1px solid var(--cb-borde); border-radius: 14px; padding: 12px 14px; background: var(--cb-suave);
+  border-top: 3px solid #2E86AB; }
+.cb-kpi span { display:block; font-size:.72rem; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
+  color: var(--cb-texto2); }
+.cb-kpi b { display:block; font-size: 1.45rem; font-weight: 800; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.cb-kpi small { display:block; font-size:.74rem; color: var(--cb-texto2); margin-top: 2px; }
+.cb-kpi.cb-ok { border-top-color: #22c55e; } .cb-kpi.cb-warn { border-top-color: #f59e0b; }
+.cb-kpi.cb-bad { border-top-color: #ef4444; }
+.cb-nota { border-left: 3px solid var(--cb-a); background: var(--cb-suave); padding: 10px 14px; border-radius: 0 12px 12px 0;
+  font-size: .88rem; margin: 6px 0 14px; }
+
+/* ---------- controles ---------- */
+.stButton > button, .stDownloadButton > button { border-radius: 12px; border: 1px solid var(--cb-borde);
+  font-weight: 600; transition: all .18s ease; }
+.stButton > button:hover, .stDownloadButton > button:hover { border-color: var(--cb-a); transform: translateY(-1px);
+  box-shadow: 0 6px 16px -10px rgba(0,0,0,.5); }
+.stButton > button[kind="primary"], .stFormSubmitButton > button {
+  background: linear-gradient(135deg, var(--cb-p), color-mix(in srgb, var(--cb-p) 60%, #2E86AB));
+  border-color: transparent; color: #fff; }
+.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button:hover { color:#fff; filter: brightness(1.12); }
+.st-key-cb_ejemplos .stButton > button { min-height: 64px; justify-content: flex-start; text-align: left; padding: 12px 16px;
+  background: var(--cb-suave); }
+[data-testid="stMetric"] { border:1px solid var(--cb-borde); border-radius: 12px; padding: 8px 12px; background: var(--cb-suave); }
+[data-testid="stMetricValue"] { font-weight: 800; }
+[data-testid="stExpander"] details { border-radius: 14px; border: 1px solid var(--cb-borde); }
+[data-testid="stTabs"] button[role="tab"] { font-weight: 600; }
+[data-testid="stVegaLiteChart"], [data-testid="stArrowVegaLiteChart"] { border:1px solid var(--cb-borde);
+  border-radius: var(--cb-radio); padding: 10px 6px 4px; background: var(--cb-suave); }
+code { font-family: 'JetBrains Mono', monospace !important; }
+
+/* ---------- chat ---------- */
+[data-testid="stChatMessage"] { border-radius: 18px; padding: 14px 18px; border: 1px solid transparent; }
+[data-testid="stChatMessage"] { border-color: var(--cb-borde); }
+[data-testid="stChatInput"] { border-radius: 18px; }
+[data-testid="stChatInput"] textarea { font-size: .95rem; }
+[data-testid="stChatInput"]:focus-within { box-shadow: 0 0 0 2px color-mix(in srgb, var(--cb-a) 60%, transparent); }
+
+@media (max-width: 640px) {
+  .cb-header { padding: 16px 18px; border-radius: 16px; } .cb-header h1 { font-size: 1.15rem; }
+  .cb-der { margin-left: 0; } .cb-hero { padding-top: 10px; } .cb-kpi b { font-size: 1.2rem; }
+}
 </style>
 """
-st.markdown(CSS.replace("%PRINCIPAL%", AJ["color_principal"]), unsafe_allow_html=True)
+st.markdown(CSS.replace("%PRINCIPAL%", AJ["color_principal"]).replace("%ACENTO%", AJ["color_acento"]),
+            unsafe_allow_html=True)
 
 LOGO = logo_svg(AJ["color_principal"], AJ["color_acento"])
 LOGO_HEADER = logo_svg("#FFFFFF00", AJ["color_acento"]).replace('fill="url(#g)"', 'fill="rgba(255,255,255,.12)"')
 
 # ---------------------------------------------------------------- barra lateral
 with st.sidebar:
-    st.markdown(f"""<div class="cb-marca">{img_svg(LOGO, 44)}
+    st.markdown(f"""<div class="cb-marca">{img_svg(LOGO, 46)}
         <div><b>{AJ['nombre_asistente']}</b><span>Agente IA propio · Confiabilidad</span></div></div>""",
                 unsafe_allow_html=True)
     if ARCHIVO_LOGO.exists():
         st.markdown(img_logo_empresa(46), unsafe_allow_html=True)
     st.divider()
-    paginas = (["💬 Asistente", "📚 Conocimiento", "⚙️ Ajustes", "ℹ️ Acerca de"] if ES_ADMIN
-               else ["💬 Asistente", "ℹ️ Acerca de"])
+    paginas = (["💬 Asistente", "🧮 Calculadoras", "📚 Conocimiento", "⚙️ Ajustes", "ℹ️ Acerca de"] if ES_ADMIN
+               else ["💬 Asistente", "🧮 Calculadoras", "ℹ️ Acerca de"])
+    if "_ir" in st.session_state:               # cambio de página pedido por un botón
+        st.session_state.pagina = st.session_state.pop("_ir")
     if st.session_state.pagina not in paginas:
         st.session_state.pagina = "💬 Asistente"
     st.radio("Navegación", paginas, key="pagina", label_visibility="collapsed")
@@ -989,7 +1269,7 @@ with st.sidebar:
         st.session_state.agente = AgenteWeb()
         st.session_state.chat = []
         st.session_state.n_calculos = 0
-        st.session_state.pagina = "💬 Asistente"
+        st.session_state["_ir"] = "💬 Asistente"
         st.rerun()
     st.download_button("⬇️ Descargar conversación", data=conversacion_markdown(st.session_state.chat, AJ),
                        file_name=f"conversacion_{datetime.now():%Y%m%d_%H%M}.md", mime="text/markdown",
@@ -1038,13 +1318,7 @@ def pagina_asistente():
         st.warning("No hay conexión con Ollama. Ábrelo (ícono de la llama junto al reloj) o revisa el servidor en ⚙️ Ajustes.")
 
     if not st.session_state.chat:
-        st.markdown("""<div class="cb-bienvenida"><h3>¿En qué te ayudo hoy?</h3>
-            <p>Pega tus datos de falla o elige un ejemplo para empezar</p></div>""", unsafe_allow_html=True)
-        cols = st.columns(3)
-        for i, (titulo, texto) in enumerate(EJEMPLOS):
-            if cols[i % 3].button(titulo, key=f"ej{i}", use_container_width=True, help=texto):
-                st.session_state.pendiente = texto
-                st.rerun()
+        portada()
 
     for rol, texto, calculos, fuentes in st.session_state.chat:
         with st.chat_message(rol, avatar="🧑‍🔧" if rol == "user" else "🛠️"):
@@ -1052,6 +1326,31 @@ def pagina_asistente():
             if calculos and AJ["mostrar_calculos"]:
                 mostrar_calculos(calculos)
             st.markdown(texto)
+
+
+def portada():
+    chips = "".join(f'<span class="cb-chip">{c}</span>' for c in
+                    ["Weibull", "MTBF · MTTR", "FMEA / RPN", "RCM", "ISO 14224", "ISO 55000", "Reemplazo óptimo"])
+    st.markdown(f"""<div class="cb-hero"><span class="cb-eyebrow">Ingeniería de Confiabilidad · IA</span>
+        <h2>¿Qué equipo vamos a <em>hacer más confiable</em> hoy?</h2>
+        <p>Pega tus datos de falla, pregunta por una norma o pide un análisis. Los números los calcula Python
+        con precisión; la IA los interpreta y te recomienda qué hacer.</p>
+        <div class="cb-chips">{chips}</div></div>""", unsafe_allow_html=True)
+    st.markdown('<div class="cb-seccion">Empieza con un ejemplo</div>', unsafe_allow_html=True)
+    with st.container(key="cb_ejemplos"):
+        cols = st.columns(3)
+        for i, (titulo, texto) in enumerate(EJEMPLOS):
+            if cols[i % 3].button(titulo, key=f"ej{i}", use_container_width=True, help=texto):
+                st.session_state.pendiente = texto
+                st.rerun()
+    st.markdown("""<div class="cb-features">
+      <div class="cb-feature"><i>🎯</i><b>Cálculos exactos</b><span>Weibull, disponibilidad, RPN y costos se calculan
+        con métodos estándar, nunca se inventan.</span></div>
+      <div class="cb-feature"><i>📊</i><b>Gráficos al instante</b><span>Curvas de confiabilidad, gráfico de
+        probabilidad y Pareto de riesgo en cada análisis.</span></div>
+      <div class="cb-feature"><i>📚</i><b>Conocimiento propio</b><span>Responde con base en documentos y normas
+        cargados en su base de conocimiento, citando la fuente.</span></div>
+    </div>""", unsafe_allow_html=True)
 
 
 def responder(pregunta: str):
@@ -1289,6 +1588,221 @@ def procesar():
     st.rerun()
 
 
+# ---------------------------------------------------------------- página: Calculadoras
+FMEA_EJEMPLO = [
+    {"Modo de falla": "Fuga por sello mecánico", "Efecto": "Derrame de crudo", "S": 8, "O": 6, "D": 5},
+    {"Modo de falla": "Falla de rodamiento", "Efecto": "Parada de la bomba", "S": 7, "O": 5, "D": 4},
+    {"Modo de falla": "Desalineación del acople", "Efecto": "Vibración alta", "S": 5, "O": 4, "D": 3},
+    {"Modo de falla": "Cavitación", "Efecto": "Desgaste del impulsor", "S": 6, "O": 3, "D": 6},
+]
+
+
+def tarjeta_resultado(etiqueta: str, valor: str, nota: str = "", tono: str = ""):
+    return (f'<div class="cb-kpi {tono}"><span>{etiqueta}</span><b>{valor}</b>'
+            f'{f"<small>{nota}</small>" if nota else ""}</div>')
+
+
+def fila_kpis(tarjetas: list[str]):
+    st.markdown(f'<div class="cb-kpis">{"".join(tarjetas)}</div>', unsafe_allow_html=True)
+
+
+def boton_interpretar(clave: str, texto: str):
+    st.write("")
+    if st.button("🤖 Pedir interpretación al agente", key=f"int_{clave}", type="primary"):
+        st.session_state.pendiente = texto
+        st.session_state["_ir"] = "💬 Asistente"
+        st.rerun()
+
+
+def calc_weibull():
+    st.markdown("##### Análisis de vida con distribución Weibull")
+    st.caption("Pega los tiempos hasta la falla (separados por coma, espacio o una columna de Excel). "
+               "Las suspensiones son equipos que no han fallado o se retiraron sin fallar.")
+    c1, c2 = st.columns(2)
+    fallas = leer_numeros(c1.text_area("Tiempos de falla", "1200, 1850, 2100, 2600, 3100, 3900", height=110))
+    susp = leer_numeros(c2.text_area("Suspensiones (opcional)", "", height=110, placeholder="Ej.: 3000, 3500"))
+    if len(fallas) < 2:
+        st.info("Ingresa al menos 2 tiempos de falla.")
+        return
+    res = ajuste_weibull(fallas, susp)
+    if "error" in res:
+        st.error(res["error"])
+        return
+    beta, eta = res["beta_forma"], res["eta_escala"]
+    tono = "cb-ok" if res["R2_ajuste"] >= 0.95 else ("cb-warn" if res["R2_ajuste"] >= 0.9 else "cb-bad")
+    fila_kpis([
+        tarjeta_resultado("β · forma", f"{beta:.2f}", res["patron_falla"].split(" (")[0]),
+        tarjeta_resultado("η · vida característica", f"{eta:,.0f}", "63,2 % ha fallado"),
+        tarjeta_resultado("MTTF", f"{res['MTTF']:,.0f}", "vida media"),
+        tarjeta_resultado("Vida B10", f"{res['vida_B10']:,.0f}", "10 % ha fallado"),
+        tarjeta_resultado("Ajuste R²", f"{res['R2_ajuste']:.3f}", "≥ 0,95 es bueno", tono),
+    ])
+    if res.get("advertencia"):
+        st.warning(res["advertencia"])
+    consejo = ("**Mortalidad infantil:** revisa montaje, arranque, calidad de repuestos y procedimientos. "
+               "El reemplazo preventivo por tiempo empeoraría las cosas." if beta < 0.95 else
+               "**Fallas aleatorias:** el reemplazo por tiempo no ayuda; usa mantenimiento basado en condición "
+               "(vibraciones, termografía, aceite)." if beta <= 1.05 else
+               "**Desgaste:** el reemplazo o la inspección preventiva pueden ser rentables. "
+               "Calcula el intervalo óptimo en la pestaña 🔧 Reemplazo óptimo.")
+    st.markdown(f'<div class="cb-nota">💡 {consejo}</div>', unsafe_allow_html=True)
+    grafico(spec_probabilidad_weibull(fallas, susp, beta, eta))
+    t_eval = st.number_input("Evaluar la confiabilidad en el tiempo", min_value=0.0, value=float(round(eta / 2)),
+                             step=100.0)
+    c1, c2 = st.columns(2)
+    with c1:
+        grafico(spec_curvas_confiabilidad(beta, eta, t_eval or None))
+    with c2:
+        grafico(spec_tasa_falla(beta, eta))
+    boton_interpretar("weibull", f"Hice un análisis Weibull con tiempos de falla {fallas}"
+                      + (f" y suspensiones {susp}" if susp else "") +
+                      f". Resultado: beta={beta}, eta={eta}, R²={res['R2_ajuste']}, MTTF={res['MTTF']}, "
+                      f"B10={res['vida_B10']}. Interprétalo y dame recomendaciones de mantenimiento.")
+
+
+def calc_indicadores():
+    st.markdown("##### Indicadores de mantenimiento")
+    c1, c2, c3 = st.columns([2, 2, 1])
+    tbf = leer_numeros(c1.text_area("Tiempos entre fallas (h)", "500, 700, 650, 820, 540", height=110))
+    ttr = leer_numeros(c2.text_area("Tiempos de reparación (h)", "5, 8, 6, 4, 7", height=110))
+    periodo = c3.number_input("Horas del periodo", min_value=0.0, value=8760.0, step=24.0,
+                              help="Opcional, para la disponibilidad operacional. 8760 h = 1 año.")
+    if not tbf or not ttr:
+        st.info("Ingresa los tiempos entre fallas y los tiempos de reparación.")
+        return
+    res = calcular_indicadores(tbf, ttr, periodo or None)
+    disp = res["disponibilidad_inherente_%"]
+    fila_kpis([
+        tarjeta_resultado("MTBF", f"{res['MTBF_h']:,.1f} h", "tiempo medio entre fallas"),
+        tarjeta_resultado("MTTR", f"{res['MTTR_h']:,.1f} h", "tiempo medio de reparación"),
+        tarjeta_resultado("Disponibilidad", f"{disp:.2f} %", "inherente",
+                          "cb-ok" if disp >= 98 else ("cb-warn" if disp >= 95 else "cb-bad")),
+        tarjeta_resultado("Tasa de falla", f"{res['tasa_falla_por_anio']:.1f}", "fallas por año"),
+    ])
+    st.progress(min(disp / 100, 1.0), text=f"Disponibilidad inherente: {disp:.2f} %")
+    if "disponibilidad_operacional_%" in res:
+        st.caption(f"Disponibilidad operacional en el periodo: {res['disponibilidad_operacional_%']:.2f} % · "
+                   f"{res['horas_fuera_servicio']:,.1f} h fuera de servicio.")
+    boton_interpretar("ind", f"Mis indicadores: MTBF={res['MTBF_h']} h, MTTR={res['MTTR_h']} h, "
+                      f"disponibilidad={disp} %, {res['numero_fallas']} fallas. ¿Qué tan buenos son y cómo los mejoro?")
+
+
+def calc_reemplazo():
+    st.markdown("##### Intervalo óptimo de reemplazo preventivo")
+    st.caption("Minimiza el costo por unidad de tiempo comparando reemplazar a tiempo contra esperar la falla.")
+    c1, c2, c3, c4 = st.columns(4)
+    beta = c1.number_input("β (forma)", min_value=0.1, value=2.8, step=0.1)
+    eta = c2.number_input("η (vida característica)", min_value=1.0, value=3000.0, step=100.0)
+    cp = c3.number_input("Costo preventivo", min_value=0.0, value=800.0, step=50.0)
+    cf = c4.number_input("Costo correctivo", min_value=0.0, value=6000.0, step=100.0)
+    res = intervalo_optimo_reemplazo(beta, eta, cp, cf)
+    if "recomendacion" in res:
+        st.warning(res["recomendacion"])
+        return
+    fila_kpis([
+        tarjeta_resultado("Intervalo óptimo", f"{res['intervalo_optimo']:,.0f}", "unidades de tiempo", "cb-ok"),
+        tarjeta_resultado("Ahorro", f"{res['ahorro_%']:.1f} %", "vs. operar hasta la falla", "cb-ok"),
+        tarjeta_resultado("Confiabilidad al cambio", f"{res['confiabilidad_al_intervalo_%']:.1f} %"),
+        tarjeta_resultado("Costo / tiempo", f"{res['costo_por_unidad_tiempo_optimo']:.3f}",
+                          f"vs. {res['costo_por_unidad_tiempo_operar_hasta_falla']:.3f} sin preventivo"),
+    ])
+    grafico(spec_costo_reemplazo(beta, eta, cp, cf, res))
+    boton_interpretar("rep", f"Con beta={beta}, eta={eta}, costo preventivo={cp} y correctivo={cf}, el intervalo "
+                      f"óptimo es {res['intervalo_optimo']} con ahorro de {res['ahorro_%']} %. "
+                      "¿Cómo lo implemento en mi plan de mantenimiento?")
+
+
+def calc_fmea():
+    st.markdown("##### FMEA · Priorización por RPN")
+    st.caption("Edita la tabla directamente: agrega filas al final, cambia textos y puntajes (1 a 10).")
+    if "fmea" not in st.session_state:
+        st.session_state.fmea = [dict(f) for f in FMEA_EJEMPLO]
+    tabla = st.data_editor(
+        st.session_state.fmea, num_rows="dynamic", use_container_width=True, key="editor_fmea",
+        column_config={
+            "Modo de falla": st.column_config.TextColumn(required=True, width="large"),
+            "Efecto": st.column_config.TextColumn(width="medium"),
+            "S": st.column_config.NumberColumn("Severidad", min_value=1, max_value=10, step=1, required=True),
+            "O": st.column_config.NumberColumn("Ocurrencia", min_value=1, max_value=10, step=1, required=True),
+            "D": st.column_config.NumberColumn("Detección", min_value=1, max_value=10, step=1, required=True),
+        })
+    filas = tabla.to_dict("records") if hasattr(tabla, "to_dict") else list(tabla)
+    modos = [{"modo": str(f.get("Modo de falla") or "").strip(), "severidad": f.get("S"),
+              "ocurrencia": f.get("O"), "deteccion": f.get("D")}
+             for f in filas if str(f.get("Modo de falla") or "").strip()]
+    modos = [m for m in modos if all(isinstance(m[k], (int, float)) and m[k] == m[k]
+                                     for k in ("severidad", "ocurrencia", "deteccion"))]
+    if not modos:
+        st.info("Completa al menos un modo de falla con sus tres puntajes.")
+        return
+    res = calcular_rpn(modos)
+    if "error" in res:
+        st.error(res["error"])
+        return
+    ranking = res["ranking"]
+    altas = sum(1 for r in ranking if r["prioridad"].startswith("ALTA"))
+    fila_kpis([
+        tarjeta_resultado("Modos analizados", str(len(ranking))),
+        tarjeta_resultado("Prioridad alta", str(altas), "acción inmediata", "cb-bad" if altas else "cb-ok"),
+        tarjeta_resultado("RPN máximo", str(ranking[0]["RPN"]), ranking[0]["modo"][:28]),
+    ])
+    grafico(spec_pareto_rpn(ranking))
+    csv = "Modo de falla;S;O;D;RPN;Prioridad\n" + "\n".join(
+        f'{r["modo"]};{r["S"]};{r["O"]};{r["D"]};{r["RPN"]};{r["prioridad"]}' for r in ranking)
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ Descargar resultado (CSV)", csv.encode("utf-8-sig"), "fmea_rpn.csv", "text/csv",
+                       use_container_width=True)
+    with c2:
+        boton_interpretar("fmea", "Este es mi FMEA priorizado por RPN: " +
+                          "; ".join(f'{r["modo"]} (S{r["S"]} O{r["O"]} D{r["D"]}, RPN {r["RPN"]})' for r in ranking) +
+                          ". Propón acciones recomendadas para los modos de mayor riesgo.")
+
+
+def calc_sistemas():
+    st.markdown("##### Confiabilidad de un sistema")
+    c1, c2, c3 = st.columns(3)
+    nombres = {"Serie": "serie", "Paralelo (redundancia)": "paralelo", "k de n": "k_de_n"}
+    config = c1.selectbox("Configuración", list(nombres))
+    n = int(c2.number_input("Número de componentes", min_value=1, max_value=20, value=3, step=1))
+    k = int(c3.number_input("k (mínimo que deben funcionar)", min_value=1, max_value=n, value=min(2, n), step=1,
+                            disabled=config != "k de n"))
+    texto = st.text_input("Confiabilidad de cada componente (0 a 1)", ", ".join(["0.9"] * n),
+                          help="Si escribes un solo valor, se usa para todos los componentes.")
+    rs = [v for v in leer_numeros(texto) if v <= 1]
+    if len(rs) == 1:
+        rs = rs * n
+    if len(rs) != n:
+        st.info(f"Escribe {n} valores entre 0 y 1 (o uno solo para todos).")
+        return
+    res = confiabilidad_sistema(nombres[config], rs, k)
+    if "error" in res:
+        st.error(res["error"])
+        return
+    total = res["confiabilidad_sistema_%"]
+    comp = {"Serie": confiabilidad_sistema("serie", rs)["confiabilidad_sistema_%"],
+            "Paralelo": confiabilidad_sistema("paralelo", rs)["confiabilidad_sistema_%"]}
+    fila_kpis([
+        tarjeta_resultado(f"Sistema · {config}", f"{total:.3f} %", "probabilidad de cumplir la función",
+                          "cb-ok" if total >= 95 else ("cb-warn" if total >= 85 else "cb-bad")),
+        tarjeta_resultado("Si fuera en serie", f"{comp['Serie']:.3f} %"),
+        tarjeta_resultado("Si fuera en paralelo", f"{comp['Paralelo']:.3f} %"),
+    ])
+    boton_interpretar("sis", f"Tengo {n} componentes con confiabilidades {rs} en configuración {config}"
+                      + (f" (k={k})" if config == "k de n" else "") +
+                      f". La confiabilidad del sistema es {total} %. ¿Cómo la mejoro?")
+
+
+def pagina_calculadoras():
+    encabezado("Calculadoras de confiabilidad · resultados exactos al instante")
+    st.markdown('<div class="cb-nota">⚡ Estas calculadoras funcionan sin usar la IA: los resultados son '
+                'instantáneos e ilimitados. Usa <b>🤖 Pedir interpretación</b> para que el agente los analice.</div>',
+                unsafe_allow_html=True)
+    tabs = st.tabs(["📈 Weibull", "⏱️ MTBF · Disponibilidad", "🔧 Reemplazo óptimo", "⚠️ FMEA", "🔗 Sistemas"])
+    for tab, funcion in zip(tabs, [calc_weibull, calc_indicadores, calc_reemplazo, calc_fmea, calc_sistemas]):
+        with tab:
+            funcion()
+
+
 # ---------------------------------------------------------------- enrutamiento
 pagina = st.session_state.pagina
 if "aviso_conocimiento" in st.session_state and pagina == "📚 Conocimiento":
@@ -1298,7 +1812,9 @@ if "aviso_conocimiento" in st.session_state and pagina == "📚 Conocimiento":
     else:
         st.toast("✅ Base de conocimiento actualizada")
 
-if pagina == "📚 Conocimiento":
+if pagina == "🧮 Calculadoras":
+    pagina_calculadoras()
+elif pagina == "📚 Conocimiento":
     pagina_conocimiento()
 elif pagina == "⚙️ Ajustes":
     pagina_ajustes()
