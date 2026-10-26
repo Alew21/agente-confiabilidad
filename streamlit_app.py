@@ -376,14 +376,52 @@ def llamar_ollama(mensajes: list[dict]) -> dict:
         return json.loads(resp.read().decode("utf-8"))["message"]
 
 
-def llamar_gemini(mensajes: list[dict]) -> dict:
-    """Gemini a través de su API compatible con OpenAI (para la versión en la nube)."""
-    limpios = [{k: v for k, v in m.items() if k != "tool_name"} for m in mensajes]
-    datos = json.dumps({"model": MODELO, "messages": limpios, "tools": HERRAMIENTAS_OLLAMA}).encode("utf-8")
+MODELOS_RESPALDO = ["gemini-3.5-flash", "gemini-2.5-flash"]   # se usan si el principal está saturado
+_ultimo_modelo_ok = None
+
+
+def _pedir_gemini(modelo: str, mensajes: list[dict]) -> dict:
+    datos = json.dumps({"model": modelo, "messages": mensajes, "tools": HERRAMIENTAS_OLLAMA}).encode("utf-8")
     req = urllib.request.Request(GEMINI_URL, data=datos, headers={
         "Content-Type": "application/json", "Authorization": f"Bearer {GEMINI_API_KEY}"})
     with urllib.request.urlopen(req, timeout=300) as resp:
         return json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]
+
+
+def llamar_gemini(mensajes: list[dict]) -> dict:
+    """Gemini (API compatible con OpenAI) con reintentos automáticos y modelos de respaldo.
+    - 500/502/503/504 (servidor saturado): reintenta con espera creciente y luego pasa al siguiente modelo.
+    - 429 (límite por minuto): espera un momento, reintenta y luego prueba otro modelo (tiene su propio cupo).
+    - 404 (modelo no existe): pasa directo al siguiente modelo."""
+    global _ultimo_modelo_ok
+    import time
+    limpios = [{k: v for k, v in m.items() if k != "tool_name"} for m in mensajes]
+    orden = [MODELO] + [m for m in MODELOS_RESPALDO if m != MODELO]
+    if _ultimo_modelo_ok in orden:                 # dentro de una misma pregunta, sigue con el que funcionó
+        orden.remove(_ultimo_modelo_ok)
+        orden.insert(0, _ultimo_modelo_ok)
+    ultimo_error = None
+    for modelo in orden:
+        for intento in range(3):
+            try:
+                mensaje = _pedir_gemini(modelo, limpios)
+                _ultimo_modelo_ok = modelo
+                return mensaje
+            except urllib.error.HTTPError as e:
+                ultimo_error = e
+                if e.code in (500, 502, 503, 504):
+                    time.sleep(1.5 * (intento + 1))
+                    continue
+                if e.code == 429 and intento == 0:
+                    time.sleep(3)
+                    continue
+                if e.code in (404, 429):
+                    break                          # probar el siguiente modelo
+                raise
+            except urllib.error.URLError as e:
+                ultimo_error = e
+                time.sleep(1.5)
+    raise ultimo_error
 
 
 def llamar_modelo(mensajes: list[dict]) -> dict:
@@ -899,7 +937,8 @@ CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html, body, .stApp, .stMarkdown, button, input, textarea, select { font-family: 'Inter', sans-serif !important; }
-#MainMenu, footer, .stDeployButton, [data-testid="stAppDeployButton"] { visibility: hidden; display: none; }
+#MainMenu, footer, .stDeployButton, [data-testid="stAppDeployButton"], [data-testid="stToolbarActions"]
+  { visibility: hidden; display: none; }
 .block-container { padding-top: 1.6rem; max-width: 1100px; }
 .cb-header { display:flex; align-items:center; flex-wrap:wrap; gap:16px; padding:18px 22px; border-radius:16px;
   background: linear-gradient(120deg, %PRINCIPAL% 0%, %PRINCIPAL% 55%, #2E86AB 100%); color:#fff; margin-bottom:20px;
@@ -1030,7 +1069,10 @@ def responder(pregunta: str):
                 respuesta = agente.preguntar_con_conocimiento(pregunta, fuentes)
             except urllib.error.HTTPError as e:
                 detalle = e.read().decode("utf-8", "ignore")
-                if EN_NUBE and e.code == 429:
+                if EN_NUBE and e.code in (500, 502, 503, 504):
+                    respuesta = ("⏳ El servicio de IA de Google está saturado en este momento. "
+                                 "Espera un minuto y vuelve a enviar tu pregunta.")
+                elif EN_NUBE and e.code == 429:
                     respuesta = ("⏳ Hay muchas preguntas al mismo tiempo y se alcanzó el límite gratuito por minuto. "
                                  "Espera unos segundos y vuelve a preguntar.")
                 elif EN_NUBE:
